@@ -86,7 +86,20 @@ def run_suricata(pcap_path: str, output_dir: str, config_path: str = "/etc/suric
         return False
 
 
+def _clean_dir(path: str):
+    d = Path(path)
+    if not d.exists():
+        return
+    for f in d.iterdir():
+        if f.is_file():
+            f.unlink()
+    logger.info("Cleaned %s", path)
+
+
 def run_all(pcap_path: str, output_dir: str = "output", suricata_dir: str = "suricata_output", suricata_config: str = "/etc/suricata/suricata.yaml") -> dict:
+    _clean_dir(output_dir)
+    _clean_dir(suricata_dir)
+
     results = {}
 
     results["zeek"] = run_zeek(pcap_path, output_dir)
