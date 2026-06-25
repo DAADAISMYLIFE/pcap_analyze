@@ -1,0 +1,4 @@
+OLLAMA_BASE_URL = "http://localhost:11434"
+MODEL_NAME = "qwen3:14b-q4_K_M"
+NUM_CTX = 16384
+TEMPERATURE = 0.3
