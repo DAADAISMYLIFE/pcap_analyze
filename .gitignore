@@ -14,3 +14,5 @@ suricata.yaml
 input/
 output/
 suricata_output/
+evidence/
+.env

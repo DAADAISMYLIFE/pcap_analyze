@@ -1,118 +1,150 @@
+import copy
 import json
 import logging
 from collections import defaultdict
-from pathlib import Path
 
 import requests
 
 import config
-from tools import TOOL_SCHEMAS, TOOL_FUNCTIONS
+from tools import TOOL_SCHEMAS, AVAILABLE_TOOLS
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT_PATH = Path(__file__).parent / "prompts" / "phase2_system.txt"
 
+def compress_evidence(evidence_data: dict) -> dict:
+    src = evidence_data.get("evidence", evidence_data)
 
-def compress_evidence(evidence: dict) -> dict:
     compressed = {}
 
-    for key in ("anomalies", "host_identification"):
-        compressed[key] = evidence.get(key, [])
+    for passthrough_key in ("host_identification", "extra_metadata"):
+        if passthrough_key in src:
+            compressed[passthrough_key] = src[passthrough_key]
 
-    sig_groups = defaultdict(lambda: {"count": 0, "severity": None, "cve": None, "src_ip": None, "dest_ip": None})
-    for a in evidence.get("signature_alerts", []):
-        sid = a.get("signature_id")
-        g = sig_groups[sid]
-        g["count"] += 1
-        g["signature"] = a.get("signature")
-        g["severity"] = a.get("severity")
-        g["cve"] = g["cve"] or a.get("cve")
-        g["src_ip"] = a.get("src_ip")
-        g["dest_ip"] = a.get("dest_ip")
-    compressed["signature_alerts"] = [
-        {**v, "signature_id": k, "occurrence_count": v.pop("count")}
-        for k, v in sig_groups.items()
-    ]
+    if "scores" in evidence_data:
+        compressed["scores"] = evidence_data["scores"]
+    elif "scores" in src:
+        compressed["scores"] = src["scores"]
 
-    compressed["behavioral_alerts"] = [
-        b for b in evidence.get("behavioral_alerts", [])
-        if b.get("suspected") is True or b.get("connection_count", 0) >= 5
-    ]
+    group_configs = {
+        "flows": ("src_ip", "dst_ip", "dst_port"),
+        "anomalies": ("src_ip", "dst_ip", "name"),
+        "signature_alerts": ("src_ip", "dest_ip", "signature"),
+        "behavioral_alerts": ("src_ip", "dst_ip", "suspected"),
+        "content_indicators": ("src_ip", "dst_ip", "type"),
+    }
 
-    dns_indicators = []
-    http_indicators = []
-    for c in evidence.get("content_indicators", []):
-        if c.get("type") == "dns_query":
-            dns_indicators.append(c)
-        elif c.get("type") == "http_download":
-            http_indicators.append(c)
+    for key, group_keys in group_configs.items():
+        items = src.get(key, [])
+        if len(items) <= 10:
+            compressed[key] = items
+            continue
 
-    seen_urls = set()
-    deduped_http = []
-    for h in http_indicators:
-        url = h.get("url", "")
-        if url not in seen_urls:
-            seen_urls.add(url)
-            deduped_http.append(h)
+        groups = defaultdict(lambda: {"count": 0, "representative": None})
+        for item in items:
+            gk = tuple(item.get(k) for k in group_keys)
+            g = groups[gk]
+            g["count"] += 1
+            if g["representative"] is None:
+                g["representative"] = dict(item)
 
-    compressed["content_indicators"] = deduped_http + dns_indicators
-
-    flow_groups = defaultdict(lambda: {"count": 0, "proto": None, "service": None, "total_orig_bytes": 0, "total_resp_bytes": 0})
-    for f in evidence.get("flows", []):
-        key = (f.get("src_ip"), f.get("dst_ip"), f.get("dst_port"))
-        g = flow_groups[key]
-        g["count"] += 1
-        g["proto"] = f.get("proto")
-        g["service"] = f.get("service")
-        g["total_orig_bytes"] += f.get("orig_bytes") or 0
-        g["total_resp_bytes"] += f.get("resp_bytes") or 0
-    compressed["flows"] = [
-        {
-            "src_ip": k[0], "dst_ip": k[1], "dst_port": k[2],
-            "proto": v["proto"], "service": v["service"],
-            "connection_count": v["count"],
-            "total_orig_bytes": v["total_orig_bytes"],
-            "total_resp_bytes": v["total_resp_bytes"],
-        }
-        for k, v in flow_groups.items()
-    ]
+        result = []
+        for g in groups.values():
+            entry = g["representative"]
+            entry["occurrence_count"] = g["count"]
+            result.append(entry)
+        compressed[key] = result
 
     return compressed
 
 
-def build_user_message(evidence: dict, scores: dict) -> str:
-    compressed = compress_evidence(evidence)
-    return json.dumps({
-        "compressed_evidence": compressed,
-        "scores": scores,
-    }, ensure_ascii=False)
-
-
-def call_ollama(messages: list, tools: list = None) -> dict:
+def _call_ollama(messages: list, model: str, tools: list = None) -> dict:
     payload = {
-        "model": config.MODEL_NAME,
+        "model": model,
         "messages": messages,
         "stream": False,
         "options": {
             "num_ctx": config.NUM_CTX,
-            "temperature": config.TEMPERATURE,
+            "num_predict": config.NUM_PREDICT,
         },
     }
     if tools:
         payload["tools"] = tools
 
     resp = requests.post(
-        f"{config.OLLAMA_BASE_URL}/api/chat",
+        f"{config.OLLAMA_HOST}/api/chat",
         json=payload,
-        timeout=300,
+        timeout=600,
     )
     resp.raise_for_status()
     return resp.json()
 
 
-def run_judge(evidence: dict, scores: dict, max_tool_rounds: int = 10) -> dict:
-    system_prompt = SYSTEM_PROMPT_PATH.read_text()
-    user_message = build_user_message(evidence, scores)
+def _parse_response_json(text: str) -> list[dict]:
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        lines = [l for l in lines if not l.strip().startswith("```")]
+        text = "\n".join(lines).strip()
+
+    start = text.find("[")
+    end = text.rfind("]")
+    if start != -1 and end != -1:
+        text = text[start:end + 1]
+    else:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1:
+            text = text[start:end + 1]
+
+    try:
+        result = json.loads(text)
+        if isinstance(result, dict):
+            return [result]
+        return result
+    except json.JSONDecodeError:
+        logger.error("Failed to parse LLM response as JSON: %s", text[:200])
+        return []
+
+
+def _post_validate(judgments: list[dict], tool_log: list[dict]) -> list[dict]:
+    validated = copy.deepcopy(judgments)
+    override_log = []
+
+    tool_results_all_no_match = True
+    for entry in tool_log:
+        result = entry.get("result", {})
+        if isinstance(result, dict) and result.get("result") != "no match found":
+            tool_results_all_no_match = False
+            break
+
+    for item in validated:
+        if item.get("case_type") != "A":
+            continue
+
+        has_cve = bool(item.get("matched_cve"))
+        if has_cve:
+            continue
+
+        if tool_results_all_no_match or not tool_log:
+            item["case_type"] = "B"
+            suffix = " [POST_VALIDATION_OVERRIDE: 도구 조회 결과 없음, case_type을 A에서 B로 강제 조정함]"
+            item["reasoning"] = item.get("reasoning", "") + suffix
+            override_log.append({
+                "action": "case_type_override",
+                "src_ip": item.get("src_ip"),
+                "original": "A",
+                "corrected": "B",
+                "reason": "all tool results were 'no match found' and no matched_cve in evidence",
+            })
+
+    return validated, override_log
+
+
+def judge_evidence(evidence_data: dict, model: str = None) -> dict:
+    model = model or config.MODEL_NAME
+    system_prompt = config.load_system_prompt()
+    compressed = compress_evidence(evidence_data)
+    user_message = json.dumps(compressed, ensure_ascii=False)
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -121,19 +153,26 @@ def run_judge(evidence: dict, scores: dict, max_tool_rounds: int = 10) -> dict:
 
     tool_log = []
 
-    for round_num in range(max_tool_rounds):
-        logger.info("LLM call round %d", round_num + 1)
-        result = call_ollama(messages, tools=TOOL_SCHEMAS)
+    for turn in range(config.MAX_TOOL_TURNS):
+        logger.info("LLM call turn %d/%d", turn + 1, config.MAX_TOOL_TURNS)
+        result = _call_ollama(messages, model, tools=TOOL_SCHEMAS)
 
         msg = result.get("message", {})
         tool_calls = msg.get("tool_calls")
 
         if not tool_calls:
-            final_content = msg.get("content", "")
+            raw_text = msg.get("content", "")
+            raw_judgments = _parse_response_json(raw_text)
+            validated_judgments, override_log = _post_validate(raw_judgments, tool_log)
+
+            for entry in override_log:
+                tool_log.append(entry)
+
             return {
-                "raw_response": final_content,
-                "tool_log": tool_log,
-                "rounds": round_num + 1,
+                "raw_model_output": raw_judgments,
+                "validated_output": validated_judgments,
+                "log": tool_log,
+                "turns": turn + 1,
             }
 
         messages.append(msg)
@@ -144,14 +183,14 @@ def run_judge(evidence: dict, scores: dict, max_tool_rounds: int = 10) -> dict:
 
             logger.info("Tool call: %s(%s)", func_name, json.dumps(func_args, ensure_ascii=False))
 
-            func = TOOL_FUNCTIONS.get(func_name)
+            func = AVAILABLE_TOOLS.get(func_name)
             if func:
                 tool_result = func(**func_args)
             else:
-                tool_result = {"error": f"unknown tool: {func_name}"}
+                tool_result = {"result": f"unknown tool: {func_name}", "source": "error"}
 
             tool_log.append({
-                "round": round_num + 1,
+                "turn": turn + 1,
                 "function": func_name,
                 "arguments": func_args,
                 "result": tool_result,
@@ -162,28 +201,21 @@ def run_judge(evidence: dict, scores: dict, max_tool_rounds: int = 10) -> dict:
                 "content": json.dumps(tool_result, ensure_ascii=False),
             })
 
-    final = call_ollama(messages)
+    logger.warning("Max tool turns (%d) reached, forcing final call", config.MAX_TOOL_TURNS)
+    result = _call_ollama(messages, model)
+    raw_text = result.get("message", {}).get("content", "")
+    raw_judgments = _parse_response_json(raw_text)
+    validated_judgments, override_log = _post_validate(raw_judgments, tool_log)
+
+    for entry in override_log:
+        tool_log.append(entry)
+
     return {
-        "raw_response": final.get("message", {}).get("content", ""),
-        "tool_log": tool_log,
-        "rounds": max_tool_rounds,
+        "raw_model_output": raw_judgments,
+        "validated_output": validated_judgments,
+        "log": tool_log,
+        "turns": config.MAX_TOOL_TURNS,
     }
-
-
-def parse_judgment(raw_response: str) -> list[dict]:
-    text = raw_response.strip()
-    if text.startswith("```"):
-        lines = text.split("\n")
-        lines = [l for l in lines if not l.strip().startswith("```")]
-        text = "\n".join(lines)
-    try:
-        result = json.loads(text)
-        if isinstance(result, dict):
-            return [result]
-        return result
-    except json.JSONDecodeError:
-        logger.error("Failed to parse LLM response as JSON")
-        return []
 
 
 if __name__ == "__main__":
@@ -193,27 +225,29 @@ if __name__ == "__main__":
 
     ap = argparse.ArgumentParser(description="Phase 2: LLM 기반 위협 판단")
     ap.add_argument("--evidence", default="evidence.json", help="evidence JSON 경로")
+    ap.add_argument("--model", default=None, help="모델명 (기본: config.MODEL_NAME)")
     args = ap.parse_args()
 
     with open(args.evidence) as f:
         data = json.load(f)
 
-    evidence = data["evidence"]
-    scores = data["scores"]
-
-    print(f"Evidence loaded: {len(scores)}개 IP 판단 대상")
-    print(f"Model: {config.MODEL_NAME}")
-    print(f"Ollama: {config.OLLAMA_BASE_URL}")
+    print(f"Model: {args.model or config.MODEL_NAME}")
+    print(f"Ollama: {config.OLLAMA_HOST}")
     print()
 
-    result = run_judge(evidence, scores)
-    print(f"Rounds: {result['rounds']}")
-    print(f"Tool calls: {len(result['tool_log'])}건")
+    result = judge_evidence(data, model=args.model)
+
+    print(f"Turns: {result['turns']}")
+    print(f"Tool calls: {len([l for l in result['log'] if 'function' in l])}건")
     print()
 
-    for t in result["tool_log"]:
-        print(f"  [{t['round']}] {t['function']}({json.dumps(t['arguments'], ensure_ascii=False)}) -> {t['result']['status']}")
+    print("=== Tool Log ===")
+    for entry in result["log"]:
+        if "function" in entry:
+            print(f"  [Turn {entry['turn']}] {entry['function']}({json.dumps(entry['arguments'], ensure_ascii=False)}) -> {entry['result']['result']}")
+        elif entry.get("action") == "case_type_override":
+            print(f"  [POST_VALIDATION] {entry['src_ip']}: {entry['original']} -> {entry['corrected']}")
 
     print()
-    judgments = parse_judgment(result["raw_response"])
-    print(json.dumps(judgments, indent=2, ensure_ascii=False))
+    print("=== Validated Output ===")
+    print(json.dumps(result["validated_output"], indent=2, ensure_ascii=False))

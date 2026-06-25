@@ -1,3 +1,21 @@
+def lookup_threat_intel(domain_or_ip: str) -> dict:
+    return {"result": "no match found", "source": "mock"}
+
+
+def get_cve_detail(cve_id: str) -> dict:
+    return {"result": "no match found", "source": "mock"}
+
+
+def search_known_malware_signature(signature_name: str) -> dict:
+    return {"result": "no match found", "source": "mock"}
+
+
+AVAILABLE_TOOLS = {
+    "lookup_threat_intel": lookup_threat_intel,
+    "get_cve_detail": get_cve_detail,
+    "search_known_malware_signature": search_known_malware_signature,
+}
+
 TOOL_SCHEMAS = [
     {
         "type": "function",
@@ -51,34 +69,3 @@ TOOL_SCHEMAS = [
         },
     },
 ]
-
-
-def lookup_threat_intel(domain_or_ip: str) -> dict:
-    return {
-        "status": "no_match",
-        "query": domain_or_ip,
-        "message": "no match found — CTI DB not connected",
-    }
-
-
-def get_cve_detail(cve_id: str) -> dict:
-    return {
-        "status": "no_match",
-        "query": cve_id,
-        "message": "no match found — CVE DB not connected",
-    }
-
-
-def search_known_malware_signature(signature_name: str) -> dict:
-    return {
-        "status": "no_match",
-        "query": signature_name,
-        "message": "no match found — malware signature DB not connected",
-    }
-
-
-TOOL_FUNCTIONS = {
-    "lookup_threat_intel": lookup_threat_intel,
-    "get_cve_detail": get_cve_detail,
-    "search_known_malware_signature": search_known_malware_signature,
-}
