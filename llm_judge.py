@@ -57,6 +57,35 @@ def compress_evidence(evidence_data: dict) -> dict:
     return compressed
 
 
+def filter_low_priority(compressed: dict, evidence_data: dict) -> dict:
+    src = evidence_data.get("evidence", evidence_data)
+    scores = evidence_data.get("scores", src.get("scores", {}))
+
+    important_ips = set()
+    for ip, info in scores.items():
+        if info.get("score", 0) >= 0.1:
+            important_ips.add(ip)
+
+    for b in src.get("behavioral_alerts", []):
+        if b.get("suspected") is True:
+            important_ips.add(b.get("src_ip"))
+            important_ips.add(b.get("dst_ip"))
+    important_ips.discard(None)
+
+    filtered = dict(compressed)
+
+    for key in ("flows", "behavioral_alerts"):
+        before = filtered.get(key, [])
+        after = [
+            item for item in before
+            if item.get("src_ip") in important_ips or item.get("dst_ip") in important_ips
+        ]
+        print(f"[filter] {key}: {len(before)} -> {len(after)} ({len(before) - len(after)}건 제외)")
+        filtered[key] = after
+
+    return filtered
+
+
 _mock_turn = 0
 
 
@@ -261,6 +290,7 @@ def judge_evidence(evidence_data: dict, model: str = None, mock: bool = False) -
     call_fn = _call_ollama_mock if mock else _call_ollama
     system_prompt = config.load_system_prompt()
     compressed = compress_evidence(evidence_data)
+    compressed = filter_low_priority(compressed, evidence_data)
     user_message = json.dumps(compressed, ensure_ascii=False)
 
     messages = [
