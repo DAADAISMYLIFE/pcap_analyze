@@ -426,11 +426,16 @@ def judge_evidence(evidence_data: dict, model: str = None, mock: bool = False) -
     print(f"\n{'='*50}")
     print(f"전체 완료: {len(target_ips)}개 IP, {total_turns} 턴")
 
+    from report_generator import generate_incident_report
+    print(f"\n[리포트 생성 시작]")
+    report = generate_incident_report(all_validated, evidence_data, model=model, mock=mock)
+
     return {
         "raw_model_output": all_raw,
         "validated_output": all_validated,
         "log": all_logs,
         "turns": total_turns,
+        "report": report,
     }
 
 
@@ -468,3 +473,7 @@ if __name__ == "__main__":
     print()
     print("=== Validated Output ===")
     print(json.dumps(result["validated_output"], indent=2, ensure_ascii=False))
+
+    print()
+    print("=== Incident Report ===")
+    print(result.get("report", "(리포트 없음)"))
