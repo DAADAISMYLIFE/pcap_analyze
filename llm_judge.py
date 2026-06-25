@@ -176,7 +176,6 @@ def _call_ollama(messages: list, model: str, tools: list = None) -> dict:
         "model": model,
         "messages": messages,
         "stream": False,
-        "format": "json",
         "options": {
             "num_ctx": config.NUM_CTX,
             "num_predict": config.NUM_PREDICT,
@@ -184,6 +183,8 @@ def _call_ollama(messages: list, model: str, tools: list = None) -> dict:
     }
     if tools:
         payload["tools"] = tools
+    else:
+        payload["format"] = "json"
 
     resp = requests.post(
         f"{config.OLLAMA_HOST}/api/chat",
