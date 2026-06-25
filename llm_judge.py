@@ -73,7 +73,7 @@ def _call_ollama(messages: list, model: str, tools: list = None) -> dict:
     resp = requests.post(
         f"{config.OLLAMA_HOST}/api/chat",
         json=payload,
-        timeout=600,
+        timeout=300,
     )
     resp.raise_for_status()
     return resp.json()
@@ -154,11 +154,11 @@ def judge_evidence(evidence_data: dict, model: str = None) -> dict:
     tool_log = []
 
     for turn in range(config.MAX_TOOL_TURNS):
-        logger.info("LLM call turn %d/%d", turn + 1, config.MAX_TOOL_TURNS)
+        print(f"[Turn {turn + 1}/{config.MAX_TOOL_TURNS}] LLM 호출 시작...")
         result = _call_ollama(messages, model, tools=TOOL_SCHEMAS)
-
         msg = result.get("message", {})
         tool_calls = msg.get("tool_calls")
+        print(f"[Turn {turn + 1}/{config.MAX_TOOL_TURNS}] 응답 받음 — tool_calls: {'있음 (' + str(len(tool_calls)) + '건)' if tool_calls else '없음 (최종 응답)'}")
 
         if not tool_calls:
             raw_text = msg.get("content", "")
@@ -180,14 +180,15 @@ def judge_evidence(evidence_data: dict, model: str = None) -> dict:
         for tc in tool_calls:
             func_name = tc["function"]["name"]
             func_args = tc["function"]["arguments"]
-
-            logger.info("Tool call: %s(%s)", func_name, json.dumps(func_args, ensure_ascii=False))
+            print(f"  -> {func_name}({json.dumps(func_args, ensure_ascii=False)})")
 
             func = AVAILABLE_TOOLS.get(func_name)
             if func:
                 tool_result = func(**func_args)
             else:
                 tool_result = {"result": f"unknown tool: {func_name}", "source": "error"}
+
+            print(f"     result: {tool_result['result']}")
 
             tool_log.append({
                 "turn": turn + 1,
@@ -201,9 +202,14 @@ def judge_evidence(evidence_data: dict, model: str = None) -> dict:
                 "content": json.dumps(tool_result, ensure_ascii=False),
             })
 
-    logger.warning("Max tool turns (%d) reached, forcing final call", config.MAX_TOOL_TURNS)
+    print(f"[최대 턴 도달] {config.MAX_TOOL_TURNS}턴 소진 — 도구 없이 최종 응답 강제 요청")
+    messages.append({
+        "role": "user",
+        "content": "최대 도구 호출 횟수에 도달했다. 더 이상 도구를 호출하지 말고, 지금까지 수집한 정보만으로 최종 JSON 판단 결과를 즉시 출력하라.",
+    })
     result = _call_ollama(messages, model)
     raw_text = result.get("message", {}).get("content", "")
+    print(f"[강제 마무리] 최종 응답 받음")
     raw_judgments = _parse_response_json(raw_text)
     validated_judgments, override_log = _post_validate(raw_judgments, tool_log)
 
@@ -214,7 +220,7 @@ def judge_evidence(evidence_data: dict, model: str = None) -> dict:
         "raw_model_output": raw_judgments,
         "validated_output": validated_judgments,
         "log": tool_log,
-        "turns": config.MAX_TOOL_TURNS,
+        "turns": config.MAX_TOOL_TURNS + 1,
     }
 
 
