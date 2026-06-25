@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+tests/fixtures/
+venv/
+.venv/
+.claude/
+result.json
+evidence.json
+suricata.yaml
+*.pcap
+*.pcap.zip
+*.zip
+input/
+output/
+suricata_output/
