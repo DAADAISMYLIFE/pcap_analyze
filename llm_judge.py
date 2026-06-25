@@ -25,11 +25,15 @@ def compress_evidence(evidence_data: dict) -> dict:
     elif "scores" in src:
         compressed["scores"] = src["scores"]
 
+    compressed["behavioral_alerts"] = [
+        b for b in src.get("behavioral_alerts", [])
+        if b.get("suspected") is True
+    ]
+
     group_configs = {
         "flows": ("src_ip", "dst_ip", "dst_port"),
         "anomalies": ("src_ip", "dst_ip", "name"),
         "signature_alerts": ("src_ip", "dest_ip", "signature"),
-        "behavioral_alerts": ("src_ip", "dst_ip", "suspected"),
         "content_indicators": ("src_ip", "dst_ip", "type"),
     }
 
@@ -80,8 +84,15 @@ def filter_low_priority(compressed: dict, evidence_data: dict) -> dict:
             item for item in before
             if item.get("src_ip") in important_ips or item.get("dst_ip") in important_ips
         ]
-        print(f"[filter] {key}: {len(before)} -> {len(after)} ({len(before) - len(after)}건 제외)")
+        print(f"[filter] {key} (IP 필터): {len(before)} -> {len(after)} ({len(before) - len(after)}건 제외)")
         filtered[key] = after
+
+    MAX_FLOWS = 50
+    flows = filtered.get("flows", [])
+    if len(flows) > MAX_FLOWS:
+        flows_sorted = sorted(flows, key=lambda f: f.get("connection_count", f.get("occurrence_count", 1)), reverse=True)
+        print(f"[filter] flows (상위 {MAX_FLOWS}개): {len(flows)} -> {MAX_FLOWS} ({len(flows) - MAX_FLOWS}건 제외)")
+        filtered["flows"] = flows_sorted[:MAX_FLOWS]
 
     return filtered
 
