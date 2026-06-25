@@ -295,15 +295,34 @@ def _finalize_response(raw_text: str, messages: list, call_fn, model: str, tool_
     }
 
 
-def judge_evidence(evidence_data: dict, model: str = None, mock: bool = False) -> dict:
-    global _mock_turn
-    _mock_turn = 0
-    model = model or config.MODEL_NAME
-    call_fn = _call_ollama_mock if mock else _call_ollama
-    system_prompt = config.load_system_prompt()
-    compressed = compress_evidence(evidence_data)
-    compressed = filter_low_priority(compressed, evidence_data)
-    user_message = json.dumps(compressed, ensure_ascii=False)
+def _extract_ip_evidence(compressed: dict, target_ip: str) -> dict:
+    ip_evidence = {}
+    for key in ("flows", "behavioral_alerts"):
+        ip_evidence[key] = [
+            item for item in compressed.get(key, [])
+            if item.get("src_ip") == target_ip or item.get("dst_ip") == target_ip
+        ]
+    for key in ("anomalies", "signature_alerts", "content_indicators"):
+        ip_evidence[key] = [
+            item for item in compressed.get(key, [])
+            if item.get("src_ip") == target_ip or item.get("dst_ip") == target_ip or item.get("dest_ip") == target_ip
+        ]
+    ip_evidence["host_identification"] = [
+        h for h in compressed.get("host_identification", [])
+        if h.get("src_ip") == target_ip
+    ]
+    scores = compressed.get("scores", {})
+    if target_ip in scores:
+        ip_evidence["scores"] = {target_ip: scores[target_ip]}
+    else:
+        ip_evidence["scores"] = {}
+    return ip_evidence
+
+
+def _judge_single_ip(ip: str, ip_evidence: dict, call_fn, model: str, system_prompt: str) -> dict:
+    user_message = json.dumps(ip_evidence, ensure_ascii=False)
+    print(f"\n{'='*50}")
+    print(f"[{ip}] 판단 시작 (evidence {len(user_message)}자)")
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -313,11 +332,11 @@ def judge_evidence(evidence_data: dict, model: str = None, mock: bool = False) -
     tool_log = []
 
     for turn in range(config.MAX_TOOL_TURNS):
-        print(f"[Turn {turn + 1}/{config.MAX_TOOL_TURNS}] LLM 호출 시작...")
+        print(f"  [Turn {turn + 1}/{config.MAX_TOOL_TURNS}] LLM 호출 시작...")
         result = call_fn(messages, model, tools=TOOL_SCHEMAS)
         msg = result.get("message", {})
         tool_calls = msg.get("tool_calls")
-        print(f"[Turn {turn + 1}/{config.MAX_TOOL_TURNS}] 응답 받음 — tool_calls: {'있음 (' + str(len(tool_calls)) + '건)' if tool_calls else '없음 (최종 응답)'}")
+        print(f"  [Turn {turn + 1}/{config.MAX_TOOL_TURNS}] 응답 받음 — tool_calls: {'있음 (' + str(len(tool_calls)) + '건)' if tool_calls else '없음 (최종 응답)'}")
 
         if not tool_calls:
             raw_text = msg.get("content", "")
@@ -328,7 +347,7 @@ def judge_evidence(evidence_data: dict, model: str = None, mock: bool = False) -
         for tc in tool_calls:
             func_name = tc["function"]["name"]
             func_args = tc["function"]["arguments"]
-            print(f"  -> {func_name}({json.dumps(func_args, ensure_ascii=False)})")
+            print(f"    -> {func_name}({json.dumps(func_args, ensure_ascii=False)})")
 
             func = AVAILABLE_TOOLS.get(func_name)
             if func:
@@ -336,7 +355,7 @@ def judge_evidence(evidence_data: dict, model: str = None, mock: bool = False) -
             else:
                 tool_result = {"result": f"unknown tool: {func_name}", "source": "error"}
 
-            print(f"     result: {tool_result['result']}")
+            print(f"       result: {tool_result['result']}")
 
             tool_log.append({
                 "turn": turn + 1,
@@ -350,15 +369,69 @@ def judge_evidence(evidence_data: dict, model: str = None, mock: bool = False) -
                 "content": json.dumps(tool_result, ensure_ascii=False),
             })
 
-    print(f"[최대 턴 도달] {config.MAX_TOOL_TURNS}턴 소진 — 도구 없이 최종 응답 강제 요청")
+    print(f"  [최대 턴 도달] 도구 없이 최종 응답 강제 요청")
     messages.append({
         "role": "user",
         "content": "최대 도구 호출 횟수에 도달했다. 더 이상 도구를 호출하지 말고, 지금까지 수집한 정보만으로 최종 JSON 판단 결과를 즉시 출력하라.",
     })
     result = call_fn(messages, model)
     raw_text = result.get("message", {}).get("content", "")
-    print(f"[강제 마무리] 최종 응답 받음")
+    print(f"  [강제 마무리] 최종 응답 받음")
     return _finalize_response(raw_text, messages, call_fn, model, tool_log, config.MAX_TOOL_TURNS + 1)
+
+
+def judge_evidence(evidence_data: dict, model: str = None, mock: bool = False) -> dict:
+    global _mock_turn
+    _mock_turn = 0
+    model = model or config.MODEL_NAME
+    call_fn = _call_ollama_mock if mock else _call_ollama
+    system_prompt = config.load_system_prompt()
+    compressed = compress_evidence(evidence_data)
+    compressed = filter_low_priority(compressed, evidence_data)
+
+    src = evidence_data.get("evidence", evidence_data)
+    scores = evidence_data.get("scores", src.get("scores", {}))
+
+    target_ips = set(scores.keys())
+    for b in compressed.get("behavioral_alerts", []):
+        if b.get("suspected") is True:
+            target_ips.add(b.get("src_ip"))
+    target_ips.discard(None)
+
+    target_ips = sorted(target_ips, key=lambda ip: scores.get(ip, {}).get("score", 0), reverse=True)
+
+    print(f"판단 대상: {len(target_ips)}개 IP")
+
+    all_raw = []
+    all_validated = []
+    all_logs = []
+    total_turns = 0
+
+    for ip in target_ips:
+        _mock_turn = 0
+        ip_evidence = _extract_ip_evidence(compressed, ip)
+        result = _judge_single_ip(ip, ip_evidence, call_fn, model, system_prompt)
+
+        if isinstance(result.get("raw_model_output"), list):
+            all_raw.extend(result["raw_model_output"])
+        else:
+            all_raw.append({"src_ip": ip, "raw_text": result.get("raw_model_output", "")})
+
+        if isinstance(result.get("validated_output"), list):
+            all_validated.extend(result["validated_output"])
+
+        all_logs.extend(result.get("log", []))
+        total_turns += result.get("turns", 0)
+
+    print(f"\n{'='*50}")
+    print(f"전체 완료: {len(target_ips)}개 IP, {total_turns} 턴")
+
+    return {
+        "raw_model_output": all_raw,
+        "validated_output": all_validated,
+        "log": all_logs,
+        "turns": total_turns,
+    }
 
 
 if __name__ == "__main__":
