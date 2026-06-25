@@ -57,11 +57,86 @@ def compress_evidence(evidence_data: dict) -> dict:
     return compressed
 
 
+_mock_turn = 0
+
+
+def _call_ollama_mock(messages: list, model: str, tools: list = None) -> dict:
+    global _mock_turn
+    _mock_turn += 1
+
+    if _mock_turn == 1 and tools:
+        return {
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"function": {"name": "search_known_malware_signature", "arguments": {"signature_name": "ET MALWARE Win32/IcedID Requesting Encoded Binary M4"}}},
+                    {"function": {"name": "lookup_threat_intel", "arguments": {"domain_or_ip": "188.166.154.118"}}},
+                ],
+            }
+        }
+
+    if _mock_turn == 2 and tools:
+        return {
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"function": {"name": "lookup_threat_intel", "arguments": {"domain_or_ip": "157.245.142.66"}}},
+                    {"function": {"name": "lookup_threat_intel", "arguments": {"domain_or_ip": "oceriesfornot.top"}}},
+                ],
+            }
+        }
+
+    compressed = None
+    for m in messages:
+        if m["role"] == "user" and m["content"].startswith("{"):
+            try:
+                compressed = json.loads(m["content"])
+            except json.JSONDecodeError:
+                pass
+            break
+
+    scores = {}
+    host_id = []
+    if compressed:
+        scores = compressed.get("scores", {})
+        host_id = compressed.get("host_identification", [])
+
+    judgments = []
+    for ip, info in scores.items():
+        base_score = info.get("score", 0)
+        host_info = {}
+        for h in host_id:
+            if h.get("src_ip") == ip:
+                host_info = {k: v for k, v in h.items() if k != "src_ip"}
+                break
+
+        judgments.append({
+            "src_ip": ip,
+            "is_attack": True if base_score >= 0.3 else "uncertain",
+            "confidence": min(base_score + 0.1, 1.0),
+            "attack_type": None,
+            "matched_cve": [],
+            "host_info": host_info,
+            "reasoning": f"base_score={base_score}. 도구 호출 결과 전부 'no match found'이므로 구체적 위협 유형 확정 불가. evidence의 시그니처 패턴과 반복 횟수 기반 행위 의심.",
+            "case_type": "B",
+        })
+
+    return {
+        "message": {
+            "role": "assistant",
+            "content": json.dumps(judgments, ensure_ascii=False),
+        }
+    }
+
+
 def _call_ollama(messages: list, model: str, tools: list = None) -> dict:
     payload = {
         "model": model,
         "messages": messages,
         "stream": False,
+        "format": "json",
         "options": {
             "num_ctx": config.NUM_CTX,
             "num_predict": config.NUM_PREDICT,
@@ -140,8 +215,50 @@ def _post_validate(judgments: list[dict], tool_log: list[dict]) -> list[dict]:
     return validated, override_log
 
 
-def judge_evidence(evidence_data: dict, model: str = None) -> dict:
+_JSON_RETRY_MSG = "방금 답변은 JSON 형식이 아니었다. 설명 없이 오직 지정된 JSON 배열만 다시 출력해라."
+
+
+def _finalize_response(raw_text: str, messages: list, call_fn, model: str, tool_log: list, turns: int) -> dict:
+    raw_judgments = _parse_response_json(raw_text)
+
+    if not raw_judgments:
+        for retry in range(2):
+            print(f"[JSON 파싱 실패] 재시도 {retry + 1}/2...")
+            messages.append({"role": "assistant", "content": raw_text})
+            messages.append({"role": "user", "content": _JSON_RETRY_MSG})
+            result = call_fn(messages, model)
+            raw_text = result.get("message", {}).get("content", "")
+            raw_judgments = _parse_response_json(raw_text)
+            if raw_judgments:
+                print(f"[JSON 파싱 성공] 재시도 {retry + 1}회차에서 성공")
+                break
+
+    if not raw_judgments:
+        print("[JSON 파싱 최종 실패] raw 텍스트를 그대로 반환")
+        return {
+            "raw_model_output": raw_text,
+            "validated_output": [],
+            "log": tool_log,
+            "turns": turns,
+        }
+
+    validated_judgments, override_log = _post_validate(raw_judgments, tool_log)
+    for entry in override_log:
+        tool_log.append(entry)
+
+    return {
+        "raw_model_output": raw_judgments,
+        "validated_output": validated_judgments,
+        "log": tool_log,
+        "turns": turns,
+    }
+
+
+def judge_evidence(evidence_data: dict, model: str = None, mock: bool = False) -> dict:
+    global _mock_turn
+    _mock_turn = 0
     model = model or config.MODEL_NAME
+    call_fn = _call_ollama_mock if mock else _call_ollama
     system_prompt = config.load_system_prompt()
     compressed = compress_evidence(evidence_data)
     user_message = json.dumps(compressed, ensure_ascii=False)
@@ -155,25 +272,14 @@ def judge_evidence(evidence_data: dict, model: str = None) -> dict:
 
     for turn in range(config.MAX_TOOL_TURNS):
         print(f"[Turn {turn + 1}/{config.MAX_TOOL_TURNS}] LLM 호출 시작...")
-        result = _call_ollama(messages, model, tools=TOOL_SCHEMAS)
+        result = call_fn(messages, model, tools=TOOL_SCHEMAS)
         msg = result.get("message", {})
         tool_calls = msg.get("tool_calls")
         print(f"[Turn {turn + 1}/{config.MAX_TOOL_TURNS}] 응답 받음 — tool_calls: {'있음 (' + str(len(tool_calls)) + '건)' if tool_calls else '없음 (최종 응답)'}")
 
         if not tool_calls:
             raw_text = msg.get("content", "")
-            raw_judgments = _parse_response_json(raw_text)
-            validated_judgments, override_log = _post_validate(raw_judgments, tool_log)
-
-            for entry in override_log:
-                tool_log.append(entry)
-
-            return {
-                "raw_model_output": raw_judgments,
-                "validated_output": validated_judgments,
-                "log": tool_log,
-                "turns": turn + 1,
-            }
+            return _finalize_response(raw_text, messages, call_fn, model, tool_log, turn + 1)
 
         messages.append(msg)
 
@@ -207,21 +313,10 @@ def judge_evidence(evidence_data: dict, model: str = None) -> dict:
         "role": "user",
         "content": "최대 도구 호출 횟수에 도달했다. 더 이상 도구를 호출하지 말고, 지금까지 수집한 정보만으로 최종 JSON 판단 결과를 즉시 출력하라.",
     })
-    result = _call_ollama(messages, model)
+    result = call_fn(messages, model)
     raw_text = result.get("message", {}).get("content", "")
     print(f"[강제 마무리] 최종 응답 받음")
-    raw_judgments = _parse_response_json(raw_text)
-    validated_judgments, override_log = _post_validate(raw_judgments, tool_log)
-
-    for entry in override_log:
-        tool_log.append(entry)
-
-    return {
-        "raw_model_output": raw_judgments,
-        "validated_output": validated_judgments,
-        "log": tool_log,
-        "turns": config.MAX_TOOL_TURNS + 1,
-    }
+    return _finalize_response(raw_text, messages, call_fn, model, tool_log, config.MAX_TOOL_TURNS + 1)
 
 
 if __name__ == "__main__":
@@ -232,16 +327,17 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Phase 2: LLM 기반 위협 판단")
     ap.add_argument("--evidence", default="evidence.json", help="evidence JSON 경로")
     ap.add_argument("--model", default=None, help="모델명 (기본: config.MODEL_NAME)")
+    ap.add_argument("--mock", action="store_true", help="Ollama 없이 mock 모드로 실행")
     args = ap.parse_args()
 
     with open(args.evidence) as f:
         data = json.load(f)
 
-    print(f"Model: {args.model or config.MODEL_NAME}")
-    print(f"Ollama: {config.OLLAMA_HOST}")
+    mode = "MOCK" if args.mock else f"{args.model or config.MODEL_NAME} @ {config.OLLAMA_HOST}"
+    print(f"Mode: {mode}")
     print()
 
-    result = judge_evidence(data, model=args.model)
+    result = judge_evidence(data, model=args.model, mock=args.mock)
 
     print(f"Turns: {result['turns']}")
     print(f"Tool calls: {len([l for l in result['log'] if 'function' in l])}건")
